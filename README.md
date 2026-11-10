@@ -107,6 +107,7 @@ PASS/FAIL with the full ffmpeg error for each, which pinpoints the problem.
 | **Stretch** | Force every video to one exact resolution. |
 | **Convert** | Batch re-encode legacy formats (e.g. MPG) to MP4. |
 | **Split** | Halve each video down the middle; output names are parsed from the source filename and editable. |
+| **Speed** | Slow down or speed up videos to fit a target length and/or frame rate (Hz); output goes to a `retimed` folder. |
 | **Updates** | Check GitHub for a newer version and install it in place. |
 
 ## Updating

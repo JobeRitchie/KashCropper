@@ -11,6 +11,7 @@ Clip tab  : Load multiple videos, scrub frame-by-frame, set in/out points,
 """
 
 import concurrent.futures
+import json
 import os
 import random
 import re
@@ -36,7 +37,7 @@ from PIL import Image, ImageTk
 # Shared constants / helpers
 # ---------------------------------------------------------------------------
 APP_NAME = "Kash Cropper"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 COLORS = [
     "#FF6B6B", "#4ECDC4", "#45B7D1", "#FFA07A", "#98D8C8",
@@ -4274,6 +4275,514 @@ class SplitTab:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Speed Tab  (slow down / speed up videos to a target length or frame rate)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _parse_duration(text: str):
+    """Parse '90', '90.5', '1:30' or '0:01:30.5' into seconds; None if invalid."""
+    parts = text.strip().split(":")
+    if not 1 <= len(parts) <= 3:
+        return None
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if any(v < 0 for v in vals) or any(v >= 60 for v in vals[1:]):
+        return None
+    secs = 0.0
+    for v in vals:
+        secs = secs * 60 + v
+    return secs if secs > 0 else None
+
+
+def _fmt_duration(secs: float) -> str:
+    """Format seconds as H:MM:SS.ss"""
+    h, rem = divmod(max(0.0, secs), 3600)
+    m, s = divmod(rem, 60)
+    return f"{int(h)}:{int(m):02d}:{s:05.2f}"
+
+
+def _probe_video(path: str):
+    """Return (frame_count, duration_s) measured by ffprobe, or None.
+
+    Frames are counted by demuxing packets rather than trusting the container
+    header, so the retimed output lands exactly on the requested length.
+    """
+    exe = shutil.which("ffprobe")
+    if not exe:
+        return None
+    try:
+        result = subprocess.run(
+            [exe, "-v", "error", "-select_streams", "v:0", "-count_packets",
+             "-show_entries",
+             "stream=nb_read_packets,avg_frame_rate,duration:format=duration",
+             "-of", "json", path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=600,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        info = json.loads(result.stdout.decode(errors="replace") or "{}")
+        stream = (info.get("streams") or [{}])[0]
+        frames = int(stream.get("nb_read_packets") or 0)
+        if frames <= 0:
+            return None
+        dur = 0.0
+        for raw in (stream.get("duration"), info.get("format", {}).get("duration")):
+            try:
+                dur = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if dur > 0:
+                break
+        if dur <= 0:
+            num, _, den = (stream.get("avg_frame_rate") or "0/1").partition("/")
+            fps = float(num) / float(den or 1) if float(den or 1) else 0.0
+            dur = frames / fps if fps > 0 else 0.0
+        return (frames, dur) if dur > 0 else None
+    except Exception:
+        return None
+
+
+def _retime_plan(frames: int, src_dur: float, target_len, target_hz):
+    """Work out how to retime one video.
+
+    target_len only : every frame kept, frame rate changed so it lasts target_len.
+    target_hz only  : every frame kept, played back at target_hz (length changes).
+    both            : stretched to target_len, then resampled to target_hz
+                      (frames are dropped or duplicated).
+
+    Returns dict(mid_fps, out_fps, out_dur, out_frames, speed, resample).
+    mid_fps is the rate the original frames are re-stamped at.
+    """
+    if target_len:
+        mid_fps = frames / target_len
+        out_dur = target_len
+        out_fps = target_hz or mid_fps
+    else:
+        mid_fps = out_fps = target_hz
+        out_dur = frames / target_hz
+    resample = bool(target_len and target_hz)
+    return {
+        "mid_fps": mid_fps, "out_fps": out_fps, "out_dur": out_dur,
+        "out_frames": int(round(out_dur * out_fps)) if resample else frames,
+        "speed": src_dur / out_dur if out_dur > 0 else 0.0,
+        "resample": resample,
+    }
+
+
+def _atempo_chain(speed: float) -> str:
+    """ffmpeg audio filter that changes tempo by `speed` (pitch preserved).
+    atempo only accepts 0.5–100 per instance, so extreme factors are chained."""
+    parts = []
+    while speed < 0.5:
+        parts.append("atempo=0.5")
+        speed /= 0.5
+    while speed > 100.0:
+        parts.append("atempo=100.0")
+        speed /= 100.0
+    parts.append(f"atempo={speed:.6f}")
+    return ",".join(parts)
+
+
+def _retime_ffmpeg_args(src: str, out_path: str, plan: dict, fmt_args: list,
+                        with_audio: bool) -> list:
+    """Build the ffmpeg argument list that applies a _retime_plan."""
+    # Re-stamp frame N at N/mid_fps, then let the fps filter emit a constant
+    # out_fps stream (a 1:1 pass-through unless we are resampling). settb
+    # first: containers like AVI use a 1/fps timebase, too coarse to hold the
+    # new timestamps, which would silently drop or duplicate frames.
+    vf = (f"settb=AVTB,setpts=N/({plan['mid_fps']:.6f}*TB),"
+          f"fps={plan['out_fps']:.6f}")
+    args = ["-hwaccel", "auto", "-i", src, "-map", "0:v:0", "-vf", vf]
+    if with_audio:
+        args += ["-map", "0:a:0", "-af", _atempo_chain(plan["speed"])]
+    else:
+        args += ["-an"]
+    return args + fmt_args + [out_path]
+
+
+class SpeedTab:
+    """
+    Slow down or speed up a batch of videos so each one fits a target length
+    and/or a target frame rate (Hz). Output goes to a 'retimed' folder next to
+    each source. Up to 4 ffmpeg processes run concurrently.
+    """
+
+    _FPS_LIMITS = (0.05, 1000.0)
+
+    def __init__(self, parent: tk.Frame, root: tk.Tk) -> None:
+        self.parent = parent
+        self.root = root
+        self._files: list = []      # {path, w, h, frames, fps, dur}
+        self._running = False
+        self._build_ui()
+
+    # ── UI ───────────────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        bar = tk.Frame(self.parent, bg=BG_DARK, pady=7)
+        bar.pack(fill=tk.X)
+        tk.Button(bar, text="  Add Videos  ", command=self._add_files,
+                  bg=ACCENT, fg=BG_DARK, font=("Segoe UI", 10, "bold"),
+                  relief=tk.FLAT, padx=4).pack(side=tk.LEFT, padx=10)
+        tk.Button(bar, text="  Remove Selected  ", command=self._remove_selected,
+                  bg=RED, fg=BG_DARK, font=("Segoe UI", 10, "bold"),
+                  relief=tk.FLAT, padx=4).pack(side=tk.LEFT, padx=2)
+        self._bar_lbl = tk.Label(bar, text="No files loaded",
+                                 bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 10))
+        self._bar_lbl.pack(side=tk.LEFT, padx=10)
+
+        body = tk.Frame(self.parent, bg=BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+
+        # ── Left: file queue ──────────────────────────────────────────────────
+        lf = tk.Frame(body, bg=BG_DARK, width=320)
+        lf.pack(side=tk.LEFT, fill=tk.Y)
+        lf.pack_propagate(False)
+        tk.Label(lf, text="Video Queue", bg=BG_DARK, fg=FG,
+                 font=("Segoe UI", 11, "bold")).pack(pady=(12, 6))
+        lb_wrap = tk.Frame(lf, bg=BG_DARK)
+        lb_wrap.pack(fill=tk.BOTH, expand=True, padx=6)
+        lb_sb = tk.Scrollbar(lb_wrap, orient=tk.VERTICAL)
+        lb_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._tree = _build_queue_tree(lb_wrap, lb_sb)
+        tk.Label(lf, text="Ctrl/Shift-click to select multiple, then Remove Selected.",
+                 bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 8),
+                 wraplength=300, justify=tk.LEFT).pack(padx=8, pady=(4, 2), anchor="w")
+
+        # ── Right: controls (packed before the centre so it keeps its width) ──
+        rf = tk.Frame(body, bg=BG_DARK, width=300)
+        rf.pack(side=tk.RIGHT, fill=tk.Y)
+        rf.pack_propagate(False)
+        tk.Label(rf, text="Speed / Retime", bg=BG_DARK, fg=FG,
+                 font=("Segoe UI", 11, "bold")).pack(pady=(14, 2))
+        tk.Label(rf, text="Slow down or speed up every video so it fits a "
+                          "target length and/or frame rate.",
+                 bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 9),
+                 wraplength=280, justify=tk.LEFT).pack(padx=8, pady=(0, 6))
+        _separator(rf)
+
+        def _target_row(text, var, default, hint):
+            row = tk.Frame(rf, bg=BG_DARK)
+            row.pack(fill=tk.X, padx=10, pady=(6, 0))
+            tk.Checkbutton(
+                row, text=text, variable=var,
+                bg=BG_DARK, fg=FG, selectcolor=BG_MID,
+                activebackground=BG_DARK, activeforeground=FG,
+                font=("Segoe UI", 9), command=self._on_target_change,
+            ).pack(side=tk.LEFT)
+            entry = tk.Entry(row, width=10, bg=BG_MID, fg=FG,
+                             insertbackground=FG, relief=tk.FLAT,
+                             font=("Segoe UI", 10))
+            entry.pack(side=tk.RIGHT)
+            entry.insert(0, default)
+            entry.bind("<KeyRelease>", lambda _: self._on_target_change())
+            tk.Label(rf, text=hint, bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 8),
+                     wraplength=280, justify=tk.LEFT).pack(padx=12, anchor="w")
+            return entry
+
+        self._len_on = tk.BooleanVar(value=True)
+        self._hz_on = tk.BooleanVar(value=False)
+        self._len_entry = _target_row(
+            "Target length", self._len_on, "10:00",
+            "Seconds, or mm:ss / h:mm:ss  (e.g. 600 or 10:00)")
+        self._hz_entry = _target_row(
+            "Target rate (Hz)", self._hz_on, "30",
+            "Frames per second of the output")
+        # Hz without a target length: resample in real time (default) rather
+        # than re-stamping the same frames, which would change playback speed.
+        self._keep_len = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            rf, text="Keep original length (drop/duplicate frames)",
+            variable=self._keep_len,
+            bg=BG_DARK, fg=FG, selectcolor=BG_MID,
+            activebackground=BG_DARK, activeforeground=FG,
+            font=("Segoe UI", 9), command=self._on_target_change,
+        ).pack(anchor="w", padx=10, pady=(2, 0))
+
+        self._mode_lbl = tk.Label(rf, text="", bg=BG_DARK, fg=YELLOW,
+                                  font=("Segoe UI", 9), wraplength=280,
+                                  justify=tk.LEFT)
+        self._mode_lbl.pack(padx=10, pady=(8, 4), anchor="w")
+        _separator(rf)
+
+        self._audio_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            rf, text="Keep audio (retimed, pitch preserved)",
+            variable=self._audio_var,
+            bg=BG_DARK, fg=FG, selectcolor=BG_MID,
+            activebackground=BG_DARK, activeforeground=FG,
+            font=("Segoe UI", 9)).pack(anchor="w", padx=10, pady=(6, 0))
+
+        fmt_row = tk.Frame(rf, bg=BG_DARK)
+        fmt_row.pack(fill=tk.X, padx=10, pady=(6, 2))
+        tk.Label(fmt_row, text="Output Format:", bg=BG_DARK, fg=FG,
+                 font=("Segoe UI", 9)).pack(anchor="w")
+        self._fmt_var = tk.StringVar(value=CROP_FORMAT_NAMES[0])
+        ttk.Combobox(fmt_row, textvariable=self._fmt_var,
+                     values=CROP_FORMAT_NAMES, state="readonly",
+                     font=("Segoe UI", 9)).pack(fill=tk.X, pady=(2, 0))
+
+        _separator(rf)
+        self._progress = tk.DoubleVar(value=0)
+        ttk.Progressbar(rf, variable=self._progress, maximum=100,
+                        style="Speed.Horizontal.TProgressbar"
+                        ).pack(fill=tk.X, padx=10, pady=(8, 3))
+        self._go_btn = tk.Button(
+            rf, text="RETIME ALL", command=self._start_thread,
+            bg=GREEN, fg=BG_DARK, font=("Segoe UI", 11, "bold"),
+            relief=tk.FLAT, pady=9)
+        self._go_btn.pack(fill=tk.X, padx=10, pady=(3, 4))
+        self._status = tk.StringVar(value="Add videos, set a target, click Retime All.")
+        tk.Label(rf, textvariable=self._status,
+                 bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 9),
+                 wraplength=280, justify=tk.LEFT
+                 ).pack(padx=10, anchor="w", pady=(0, 8))
+
+        # ── Center: per-file plan ─────────────────────────────────────────────
+        center = tk.Frame(body, bg=BG)
+        center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
+        tk.Label(center, text="Retime Plan", bg=BG, fg=FG,
+                 font=("Segoe UI", 11, "bold")).pack(pady=(8, 4))
+        tk.Label(center, text="Retimed videos have different frame numbers: "
+                              "pose/keypoint files (DLC, SLEAP) and frame-indexed "
+                              "labels made from the originals will no longer "
+                              "match. Retime first, then run pose estimation.",
+                 bg=BG, fg=YELLOW, font=("Segoe UI", 9), wraplength=520,
+                 justify=tk.LEFT).pack(side=tk.BOTTOM, anchor="w", pady=(6, 0))
+        txt_wrap = tk.Frame(center, bg=BG_MID, bd=1, relief=tk.SOLID)
+        txt_wrap.pack(fill=tk.BOTH, expand=True)
+        txt_sb = tk.Scrollbar(txt_wrap, orient=tk.VERTICAL)
+        txt_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._queue_text = tk.Text(
+            txt_wrap, yscrollcommand=txt_sb.set,
+            bg=BG_DARK, fg=FG, font=("Consolas", 9),
+            relief=tk.FLAT, state=tk.DISABLED, wrap=tk.NONE,
+            highlightthickness=0, borderwidth=0, padx=8, pady=8)
+        self._queue_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        txt_sb.config(command=self._queue_text.yview)
+
+        self._on_target_change()
+
+    # ── Targets ───────────────────────────────────────────────────────────────
+
+    def _targets(self):
+        """Return (target_len, target_hz, error). Disabled targets are None."""
+        target_len = target_hz = None
+        if self._len_on.get():
+            target_len = _parse_duration(self._len_entry.get())
+            if target_len is None:
+                return None, None, "Target length is not a valid time."
+        if self._hz_on.get():
+            try:
+                target_hz = float(self._hz_entry.get())
+            except ValueError:
+                target_hz = 0.0
+            lo, hi = self._FPS_LIMITS
+            if not lo <= target_hz <= hi:
+                return None, None, f"Target rate must be between {lo:g} and {hi:g} Hz."
+        if target_len is None and target_hz is None:
+            return None, None, "Tick a target length and/or a target rate."
+        return target_len, target_hz, None
+
+    def _plan_for(self, frames, dur, target_len, target_hz, keep_len) -> dict:
+        """Retime plan for one file. With only a rate set and `keep_len` on,
+        the file's own length becomes the target, so it is resampled in real
+        time instead of being sped up or slowed down."""
+        if target_len is None and keep_len:
+            target_len = dur
+        return _retime_plan(frames, dur, target_len, target_hz)
+
+    def _plan_error(self, plan: dict):
+        lo, hi = self._FPS_LIMITS
+        if not lo <= plan["mid_fps"] <= hi:
+            return (f"needs {plan['mid_fps']:.3f} Hz — outside the "
+                    f"{lo:g}–{hi:g} Hz range")
+        return None
+
+    def _on_target_change(self) -> None:
+        target_len, target_hz, err = self._targets()
+        if err:
+            mode = err
+        elif target_len and target_hz:
+            mode = ("Each video is stretched to the target length, then "
+                    "resampled to the target rate (frames dropped/duplicated).")
+        elif target_len:
+            mode = ("Every frame is kept; the frame rate changes so each video "
+                    "lasts exactly the target length.")
+        elif self._keep_len.get():
+            mode = ("Each video keeps its own length and playback speed; "
+                    "frames are dropped/duplicated to reach the target rate.")
+        else:
+            mode = ("Every frame is kept and played at the target rate, so "
+                    "the length changes.")
+        self._mode_lbl.config(text=mode, fg=RED if err else YELLOW)
+        self._refresh_queue()
+
+    # ── File management ───────────────────────────────────────────────────────
+
+    def _add_files(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title="Select videos to retime", filetypes=VIDEO_FILETYPES)
+        if not paths:
+            return
+        existing = {f["path"] for f in self._files}
+        added = 0
+        for p in paths:
+            if p in existing:
+                continue
+            cap = cv2.VideoCapture(p)
+            opened = cap.isOpened()
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = float(cap.get(cv2.CAP_PROP_FPS)) or 0.0
+            cap.release()
+            if not opened or frames <= 0 or fps <= 0:
+                continue
+            self._files.append({"path": p, "w": w, "h": h, "frames": frames,
+                                "fps": fps, "dur": frames / fps})
+            added += 1
+        if not added:
+            return
+        self._refresh_list()
+        self._bar_lbl.config(text=f"{len(self._files)} file(s) loaded")
+        self._status.set(f"Added {added} file(s). Set a target and click Retime All.")
+        self._refresh_queue()
+
+    def _refresh_list(self) -> None:
+        self._tree.delete(*self._tree.get_children())
+        for i, f in enumerate(self._files):
+            self._tree.insert("", "end", iid=str(i),
+                              text=os.path.basename(f["path"]),
+                              values=(_folder_of(f["path"]),))
+
+    def _remove_selected(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        for idx in sorted((int(i) for i in sel), reverse=True):
+            self._files.pop(idx)
+        self._refresh_list()
+        self._bar_lbl.config(
+            text=f"{len(self._files)} file(s) loaded" if self._files else "No files loaded")
+        self._refresh_queue()
+
+    def _refresh_queue(self) -> None:
+        if not hasattr(self, "_queue_text"):
+            return
+        target_len, target_hz, err = self._targets()
+        self._queue_text.config(state=tk.NORMAL)
+        self._queue_text.delete("1.0", tk.END)
+        for i, f in enumerate(self._files, 1):
+            line = (f"{i:>2}. {os.path.basename(f['path'])}\n"
+                    f"     now  {f['frames']:>8} fr  {f['fps']:>8.3f} Hz  "
+                    f"{_fmt_duration(f['dur'])}\n")
+            if not err:
+                plan = self._plan_for(f["frames"], f["dur"], target_len,
+                                      target_hz, self._keep_len.get())
+                bad = self._plan_error(plan)
+                if bad:
+                    line += f"     CANNOT RETIME: {bad}\n"
+                else:
+                    line += (f"     out  {plan['out_frames']:>8} fr  "
+                             f"{plan['out_fps']:>8.3f} Hz  "
+                             f"{_fmt_duration(plan['out_dur'])}   "
+                             f"{plan['speed']:.3f}x speed\n")
+            self._queue_text.insert(tk.END, line + "\n")
+        self._queue_text.config(state=tk.DISABLED)
+
+    # ── Retiming (parallel ffmpeg) ────────────────────────────────────────────
+
+    def _start_thread(self) -> None:
+        if self._running:
+            return
+        if not self._files:
+            messagebox.showwarning("No Files", "Add at least one video file first.")
+            return
+        if not _ffmpeg_available():
+            messagebox.showwarning(
+                "ffmpeg Missing",
+                "ffmpeg must be installed and on PATH to retime videos.")
+            return
+        target_len, target_hz, err = self._targets()
+        if err:
+            messagebox.showwarning("Invalid Target", err)
+            return
+        jobs = [dict(f) for f in self._files]
+        self._running = True
+        self._go_btn.config(state=tk.DISABLED)
+        self._progress.set(0)
+        self._status.set(f"Retiming {len(jobs)} file(s)…")
+        threading.Thread(
+            target=self._do_retime,
+            args=(jobs, target_len, target_hz, self._keep_len.get(),
+                  self._fmt_var.get(), self._audio_var.get()),
+            daemon=True).start()
+
+    def _do_retime(self, jobs, target_len, target_hz, keep_len, fmt_key,
+                   keep_audio) -> None:
+        fmt_args, out_ext = OUTPUT_FORMATS.get(fmt_key, list(OUTPUT_FORMATS.values())[0])
+        n = len(jobs)
+        done_count = [0]
+        errors = []
+        lock = threading.Lock()
+
+        def _process_one(job: dict):
+            src = job["path"]
+            name = os.path.basename(src)
+            probed = _probe_video(src)
+            frames, dur = probed if probed else (job["frames"], job["dur"])
+            plan = self._plan_for(frames, dur, target_len, target_hz, keep_len)
+            bad = self._plan_error(plan)
+            if bad:
+                return f"{name}: {bad}"
+            out_dir = os.path.join(os.path.dirname(os.path.abspath(src)), "retimed")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(
+                out_dir, os.path.splitext(name)[0] + out_ext)
+            try:
+                _run_ffmpeg(_retime_ffmpeg_args(
+                    src, out_path, plan, fmt_args,
+                    keep_audio and _has_audio(src)))
+                return None
+            except RuntimeError as exc:
+                return f"{name}: {exc}"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, n)) as exe:
+            for fut in concurrent.futures.as_completed(
+                    [exe.submit(_process_one, job) for job in jobs]):
+                err = fut.result()
+                with lock:
+                    if err:
+                        errors.append(err)
+                    done_count[0] += 1
+                self.root.after(0, self._progress.set, done_count[0] / n * 100)
+
+        def _finish() -> None:
+            self._running = False
+            self._go_btn.config(state=tk.NORMAL)
+            self._progress.set(100)
+            _play_cash_register()
+            if errors:
+                messagebox.showerror(
+                    "Retime Errors",
+                    f"{len(errors)} file(s) failed:\n\n"
+                    + "\n".join(e[:200] for e in errors[:5]))
+                self._status.set(
+                    f"Done with {len(errors)} error(s).  "
+                    f"{n - len(errors)} file(s) succeeded.")
+            else:
+                self._status.set(
+                    f"Done!  {n} file(s) saved to 'retimed' folder(s).")
+                messagebox.showinfo(
+                    "Retime Complete",
+                    f"{n} video(s) retimed.\n"
+                    "Output saved to a 'retimed' folder next to each source video.")
+
+        self.root.after(0, _finish)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Update engine  (git-based, checked against the GitHub remote)
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -4746,6 +5255,8 @@ class WelcomeTab:
         ("Convert",      "Batch re-encode legacy formats (e.g. MPG) to MP4."),
         ("Split",        "Halve each video down the middle; output names are "
                           "parsed from the source filename and editable."),
+        ("Speed",        "Slow down or speed up videos to fit a target length "
+                          "and/or frame rate (Hz)."),
         ("Updates",      "Check GitHub for a newer version and install it "
                           "in place."),
     ]
@@ -4818,13 +5329,14 @@ class KashCropperApp:
         style.theme_use("clam")
         for name, color in (("Crop", GREEN), ("Clip", ACCENT), ("BatchCrop", GREEN),
                             ("Brightness", PURPLE), ("Stretch", YELLOW),
-                            ("Convert", ACCENT), ("Split", RED)):
+                            ("Convert", ACCENT), ("Split", RED),
+                            ("Speed", PURPLE)):
             style.configure(f"{name}.Horizontal.TProgressbar",
                             troughcolor=BG_MID, background=color,
                             bordercolor=BG_MID, lightcolor=color, darkcolor=color)
         style.configure("TNotebook", background=BG, borderwidth=0, tabmargins=0)
         style.configure("TNotebook.Tab", background=BG_MID, foreground=FG_DIM,
-                        font=("Segoe UI", 11, "bold"), padding=(22, 9))
+                        font=("Segoe UI", 11, "bold"), padding=(14, 9))
         style.map("TNotebook.Tab",
                   background=[("selected", BG_DARK)],
                   foreground=[("selected", ACCENT)])
@@ -4854,6 +5366,7 @@ class KashCropperApp:
         stretch_frame    = tk.Frame(nb, bg=BG)
         convert_frame    = tk.Frame(nb, bg=BG)
         split_frame      = tk.Frame(nb, bg=BG)
+        speed_frame      = tk.Frame(nb, bg=BG)
         updates_frame    = tk.Frame(nb, bg=BG)
         nb.add(welcome_frame,    text="  Welcome       ")
         nb.add(crop_frame,       text="  Crop Regions  ")
@@ -4863,6 +5376,7 @@ class KashCropperApp:
         nb.add(stretch_frame,    text="  Stretch       ")
         nb.add(convert_frame,    text="  Convert       ")
         nb.add(split_frame,      text="  Split         ")
+        nb.add(speed_frame,      text="  Speed         ")
         nb.add(updates_frame,    text="  Updates       ")
 
         WelcomeTab(welcome_frame, root)
@@ -4883,6 +5397,7 @@ class KashCropperApp:
         StretchTab(stretch_frame, root)
         ConvertTab(convert_frame, root)
         SplitTab(split_frame, root)
+        SpeedTab(speed_frame, root)
         self.updates = UpdatesTab(updates_frame, root, nb, updates_frame)
 
         # Look for a new version in the background once the window is up, so a

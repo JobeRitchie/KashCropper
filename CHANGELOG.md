@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.0
+
+- **Speed tab** — slow down or speed up one or many videos to a target length
+  and/or a target frame rate (Hz). Length only keeps every frame and changes the
+  rate to fit. Hz only resamples in real time by default (same length, frames
+  dropped/duplicated), or re-stamps every frame at the new rate if "Keep
+  original length" is unticked. Both together stretches to the length and
+  resamples to the rate.
+  A per-file plan shows the resulting frames, Hz, length and speed before you
+  run. Audio is retimed with pitch preserved. Output goes to a `retimed` folder.
+- Narrower tab padding so all tabs fit the default window.
+
 ## 1.1.0
 
 - **Updates tab** — checks the GitHub remote for new commits and installs them
